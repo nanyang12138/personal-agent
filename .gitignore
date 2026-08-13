@@ -1,0 +1,24 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Runtime state is local and must never be committed.
+.personal-agent/
+state.db
+state.db-*
+episodes/
+memory/
+candidates/
+
+# Secrets and local settings.
+.env
+.env.*
+*.key
+*.pem
+settings.local.json
