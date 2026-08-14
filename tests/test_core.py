@@ -1,5 +1,4 @@
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,19 +17,38 @@ class PersonalAgentStoreTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tempdir.cleanup()
 
-    def test_initialize_creates_package_memory_and_evals(self) -> None:
-        self.assertTrue((self.home / "package" / "manifest.json").exists())
-        self.assertTrue((self.home / "package" / "rules" / "core.md").exists())
-        self.assertTrue(
-            (
-                self.home
-                / "package"
-                / "skills"
-                / "evidence-first-work"
-                / "SKILL.md"
-            ).exists()
+    def update_manifest(self, **updates: object) -> None:
+        manifest = json.loads(self.store.manifest_path.read_text(encoding="utf-8"))
+        for key, value in updates.items():
+            manifest[key] = value
+        self.store.manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
         )
-        self.assertTrue((self.home / "memory" / "MEMORY.md").exists())
+
+    def enable_redacted_capture(self) -> None:
+        manifest = self.store.manifest()
+        manifest["capture"].update(
+            {
+                "episodes": True,
+                "mode": "redacted",
+                "preview_chars": 1000,
+            }
+        )
+        self.store.manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def test_initialize_creates_package_memory_and_evals(self) -> None:
+        profile = self.home / "user" / "profiles" / "default"
+        self.assertTrue((profile / "manifest.json").exists())
+        self.assertTrue((profile / "rules").is_dir())
+        self.assertTrue((profile / "skills").is_dir())
+        self.assertEqual(list((profile / "rules").iterdir()), [])
+        self.assertEqual(list((profile / "skills").iterdir()), [])
+        self.assertTrue((profile / "memory" / "MEMORY.md").exists())
+        self.assertEqual(self.store.status()["data_schema_version"], 4)
         self.assertGreaterEqual(len(self.store.list_evals()), 2)
 
     def test_context_selects_rules_skill_memory_and_eval(self) -> None:
@@ -54,18 +72,16 @@ class PersonalAgentStoreTests(unittest.TestCase):
         )
         self.assertIn("Relevant skill: evidence-first-work", context)
 
-    def test_repeated_correction_auto_promotes_low_risk_memory(self) -> None:
+    def test_repeated_correction_requires_manual_promotion(self) -> None:
         for _ in range(3):
             candidate_id = self.store.stage_candidate(
                 text="以后分析失败时应该先检查原始日志。",
                 kind="lesson",
                 reason="test",
             )
-        candidates = self.store.list_candidates(status="approved")
-        memories = self.store.list_memories()
+        candidates = self.store.list_candidates(status="pending")
         self.assertEqual(len(candidates), 1)
-        self.assertEqual(len(memories), 1)
-        self.assertIn("原始日志", memories[0]["text"])
+        self.assertEqual(len(self.store.list_memories()), 0)
         self.store.approve_candidate(candidate_id)
         self.assertEqual(len(self.store.list_memories()), 1)
 
@@ -74,6 +90,7 @@ class PersonalAgentStoreTests(unittest.TestCase):
             self.store.add_memory("api_key=abcdefghijklmnopqrstuvwxyz123456")
 
     def test_prompt_and_stop_hooks_record_episode_and_eval(self) -> None:
+        self.enable_redacted_capture()
         prompt_result = user_prompt_submit(
             self.store,
             {
@@ -102,45 +119,15 @@ class PersonalAgentStoreTests(unittest.TestCase):
         self.assertEqual(episodes[0]["status"], "completed")
         self.assertEqual(self.store.failed_eval_results(int(episodes[0]["id"])), [])
 
-    def test_stop_hook_rechecks_eval_after_one_continuation(self) -> None:
-        user_prompt_submit(
-            self.store,
-            {
-                "session_id": "session-2",
-                "prompt_id": "prompt-2",
-                "cwd": "C:\\repo",
-                "prompt": "请实现这个修改。",
-            },
-        )
-        old_value = os.environ.get("PERSONAL_AGENT_ENFORCE_EVALS")
-        os.environ["PERSONAL_AGENT_ENFORCE_EVALS"] = "1"
-        try:
-            first = stop_hook(
-                self.store,
-                {
-                    "session_id": "session-2",
-                    "last_assistant_message": "修改已经完成。",
-                    "stop_hook_active": False,
-                },
+    def test_required_text_eval_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self.store.add_eval(
+                name="required-verification",
+                query_terms=["实现", "修改"],
+                required_any=["测试", "验证"],
+                forbidden_any=[],
+                severity="required",
             )
-            self.assertIn("additionalContext", first["hookSpecificOutput"])
-
-            second = stop_hook(
-                self.store,
-                {
-                    "session_id": "session-2",
-                    "last_assistant_message": "修改已经完成，并运行测试完成验证。",
-                    "stop_hook_active": True,
-                },
-            )
-            self.assertEqual(second, {})
-            episode_id = int(self.store.list_episodes()[0]["id"])
-            self.assertEqual(self.store.failed_eval_results(episode_id), [])
-        finally:
-            if old_value is None:
-                os.environ.pop("PERSONAL_AGENT_ENFORCE_EVALS", None)
-            else:
-                os.environ["PERSONAL_AGENT_ENFORCE_EVALS"] = old_value
 
     def test_install_claude_preserves_existing_settings(self) -> None:
         settings = Path(self.tempdir.name) / ".claude" / "settings.json"
@@ -154,8 +141,17 @@ class PersonalAgentStoreTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        hook_executable = Path(self.tempdir.name) / "personal-agent.exe"
+        hook_executable.write_text("test", encoding="utf-8")
 
-        result = install_claude(self.store, settings_path=settings, dry_run=False)
+        result = install_claude(
+            self.store,
+            settings_path=settings,
+            dry_run=False,
+            enable_auto_memory=True,
+            allow_unsupported_claude=True,
+            hook_executable=str(hook_executable),
+        )
         installed = json.loads(settings.read_text(encoding="utf-8"))
         self.assertEqual(installed["model"], "test-model")
         self.assertEqual(installed["env"]["EXISTING_VALUE"], "preserve-me")
@@ -164,7 +160,10 @@ class PersonalAgentStoreTests(unittest.TestCase):
         self.assertEqual(installed["autoMemoryDirectory"], str(self.store.memory_dir))
         self.assertIn("UserPromptSubmit", installed["hooks"])
         self.assertIn("Stop", installed["hooks"])
-        self.assertTrue(Path(result["backup_path"]).exists())
+        handler = installed["hooks"]["UserPromptSubmit"][0]["hooks"][0]
+        self.assertEqual(handler["command"], str(hook_executable.resolve()))
+        self.assertEqual(handler["args"], ["hook", "user-prompt-submit"])
+        self.assertTrue(Path(result["install_manifest"]).exists())
 
 
 if __name__ == "__main__":
